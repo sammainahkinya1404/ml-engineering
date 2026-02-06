@@ -1,8 +1,8 @@
 # Storage: File Systems and IO
 
-## 3 Machine Learning IO needs
+## Machine Learning IO needs
 
-There are 3 distinct IO needs in the ML workload:
+For training workloads there are 3 distinct IO needs:
 
 1. You need to be able to feed the DataLoader fast - (super fast read, don't care about fast write) - requires sustainable load for hours and days
 2. You need to be able to write checkpoints fast - (super fast write, fastish read as you will be resuming a few times) - requires burst writing - you want super fast to not block the training for long (unless you use some sort of cpu offloading to quickly unblock the training)
@@ -12,7 +12,17 @@ As you can see these 3 have very different requirements both on speed and sustai
 
 If you have infinite funds, of course, get a single super-fast read, super-fast write, that can do that for days non-stop. But for most of us, this is not possible so getting 2 or 3 different types of partitions where you end up paying much less is a wiser choice.
 
+For inference, it's mostly about startup time to be able to start serving inference asap:
+1. Reading the checkpoint fast
+2. Loading the codebase fast 
 
+For batched inference, you'd have additionally:
+1. Reading prompts
+2. Writing generated outputs
+
+If this is done asynchroniously to generation then this IO overhead can be completely hidden, since typically generation will be much slower than loading the text it generates from and writing the generated text back to the disk.
+
+If you do KV-cache offloading to disk, this would be another important IO use-case for inference. You will need to be able to seek fast to get to the desired KV-cache index and less crucial writing it out if the latter is done asynchronously. 
 
 
 ## Glossary
@@ -33,29 +43,35 @@ If you have infinite funds, of course, get a single super-fast read, super-fast 
 
 Distributed parallel file systems dramatically improve performance where hundreds to thousands of clients can access the shared storage simultaneously. They also help a lot with reducing hotspots (where some data pockets are accessed much more often than others).
 
-The 2 excellent performing parallel file systems that I had experience with are:
+The 3 excellent performing parallel file systems that I had experience with are:
 
+- [GPFS](https://en.wikipedia.org/wiki/GPFS) (IBM), recently renamed to IBM Storage Scale, and
+  before that it was called IBM Spectrum Scale.
+- [WekaIO](https://www.weka.io/)
 - [Lustre FS](https://www.lustre.org/) (Open Source) ([Wiki](https://wiki.lustre.org/Main_Page))
-- [GPFS](https://en.wikipedia.org/wiki/GPFS) (IBM), recently renamed to IBM Storage Scale, and before that it was called IBM Spectrum Scale.
 
-Both solutions have been around for 2+ decades. Both are POSIX-compliant. These are also not trivial to create - you have to setup a whole other cluster with multiple cpu-only VMs dedicated exclusively for those filesystems - only then you can mount those. As compared to weaker cloud-provided "built-in" solutions which take only a few screens of questions to answer in order to activate. And when creating the storage cluster there is a whole science to which VMs to choose for which functionality. For example, here is a [Lustre guide on GCP](https://cloud.google.com/architecture/lustre-architecture).
+These solutions have been around for 2+ decades. They are POSIX-compliant. These are also not trivial to create - you have to setup a whole other cluster with multiple cpu-only VMs dedicated exclusively for those filesystems - only then you can mount those. As compared to weaker cloud-provided "built-in" solutions which take only a few screens of questions to answer in order to activate. And when creating the storage cluster there is a whole science to which VMs to choose for which functionality. For example, here is a [Lustre guide on GCP](https://cloud.google.com/architecture/parallel-file-systems-for-hpc#overview_of_lustre_and_exascaler_cloud).
 
-case study: At JeanZay HPC (France) we were saving 2.3TB checkpoint in parallel on 384 processes in 40 secs! This is insanely fast - and it was GPFS over NVME drives.
+case study: At JeanZay HPC (France) in 2021 we were saving 2.3TB checkpoint in parallel on 384 processes in 40 secs! This is insanely fast - and it was GPFS over NVME drives.
 
 NASA's cluster has [a long long list of gotchas around using Lustre](https://www.nas.nasa.gov/hecc/support/kb/lustre-best-practices_226.html).
 
-Some very useful pros of GFPS:
-- If you have a lot of small files, you can easily run out of inodes (`df -i` to check). GFPS 5.x never runs out of inodes, it dynamically creates more as needed
+Some very useful pros of GPFS:
+- If you have a lot of small files, you can easily run out of inodes (`df -i` to check). GPFS 5.x never runs out of inodes, it dynamically creates more as needed
 - GPFS doesn't have the issue Lustre has where you can run out of disk space at 80% if one of the sub-disks got full and wasn't re-balanced in time - you can reliably use all 100% of the allocated storage.
 - GPFS doesn't use a central metadata server (or a cluster of those) which often becomes a bottleneck when dealing with small files. Just like data, metatada is handled by each node in the storage cluster.
 - GPFS comes with a native NSD client which is superior to the generic NFS client, but either can be used with it.
+- One can build a multi-tier system. So for example, Tier 1 is usually made from NVME drives and Tier 2 usually uses some cloud storage system. So when the Tier 1 capacity gets low, files that haven't been accessed in some time, get auto-moved to the cloud storage. So for example your Tier 1 could be 100TB, and Tier 2 could be 1PB. This approach saves a lot of money, since 1PB of cloud storage is significantly cheaper than 1PB of NVME drives.
+- Data protection can use various RAID approaches. Typically striping is used to save costs.
+
+Weka is quite similar to GPFS in features and performance. The main difference would be the licensing cost you can negotiate with either provider. A big part of your cost will be in the cost of the VMs required to run the system - e.g. if you have a lot of small files you'd want many VMs to quickly deal with meta-data.
 
 Other parallel file systems I don't yet have direct experience with:
 
 - [BeeGFS](https://www.beegfs.io/)
-- [WekaIO](https://www.weka.io/)
 - [DAOS](https://docs.daos.io/) (Distributed Asynchronous Object Storage) (Intel)
 - [NetApp](https://www.netapp.com)
+- [VAST](https://www.vastdata.com/)
 
 Most clouds provide at least one implementation of these, but not all. If your cloud provider doesn't provide at least one of these and they don't have a fast enough alternative to meet your needs you should reconsider.
 
@@ -86,6 +102,12 @@ case study: Python is so bad at having tens of thousand of tiny files that if yo
 
 The good news is that modern solutions are starting to introduce a dynamic block size. For example, the most recent GPFS supports sub-blocks. So, for example, it's possible to configure GPFS with a block size of 2mb, with a sub-block of 8k, and then the tiny files get packed together as sub-blocks, thus not wasting too much disk space.
 
+## Distributed storage servers proximity to clients
+
+The cluster that uses a shared distributed storage should have the storage servers places close to the cluster that uses those servers. If the VMs running the storage servers are located many hops (switches) away, the IO latency can be high and the interactive use of the storage can be frustratingly slow. Think any interactions with metadata servers as an example, when you try to run `du` and other tools that access metadata of many files.
+
+So if you have control ask the cloud provider to give you the cpu-only storage servers VMs allocated as close as possible to your accelerator VMs network-distance-wise.
+
 
 
 ## Cloud shared storage solutions
@@ -94,7 +116,7 @@ Here are shared file system storage solutions made available by various cloud pr
 
 - [GCP](https://cloud.google.com/architecture/filers-on-compute-engine)
 - [Azure](https://learn.microsoft.com/en-us/azure/virtual-machines/disks-shared)
-- [AWS](https://aws.amazon.com/what-is/nas/#seo-faq-pairs#how-can-aws-help-with-storage-solutions)
+- [AWS](https://aws.amazon.com/what-is/nas/#how-can-aws-help-with-storage-solutions--mxce5s)
 
 
 ## Local storage beats cloud storage
@@ -548,6 +570,22 @@ The first command leaves files that are younger than 3 days in place, in case so
 
 As usual you may need to adjust the paths if you placed your caches elsewhere.
 
+note: if your team uses `HF_HOME` to share the HF hub models/datasets/etc - the `$HF_HOME/token` will get shared as well, which works fine as long as ungated models are used. But if you want to access gated models you might run into problems there. Therefore you most likely want to not share the access token. You can fix that by adding something like:
+
+```
+export HF_TOKEN_PATH=~/.cache/hf_hub_token
+```
+(then put it into `~/.bashrc` to always work)
+
+and now how each user run once:
+```
+huggingface-cli login
+```
+which will ask them to add their access token from https://huggingface.co/settings/tokens - it'll save it under `~/.cache/hf_hub_token`.
+
+Now each member of your team will have their unique token and the gated models approved for their HF hub user will now be accessible by them.
+
+
 ### Python package manager cleanups
 
 conda and pip will pile up more and more files on your system over time. conda is the worst because it keeps the untarred files which consume an insane amount of inodes and make backups and scans slow. pip at least caches just the wheels (tarred files).
@@ -650,12 +688,12 @@ tmpfs             16M  1.9K   16M    1% /run
 
 Normally compute nodes will use `/tmp/` for temp files. The problem is on most set ups `/tmp` resides on the tiny `/` filesystem of each node (often <100GB) and since `/tmp/` only gets reset on reboot, this doesn't get cleaned up between SLURM jobs and this leads to `/tmp` running out of space and so when you try to run something that let's say untars a file you're likely to run into:
 
-```
+```bash
 OSError: [Errno 28] No space left on device
 ```
 
 The solution is to set in your SLURM launcher script.
-```
+```bash
 export TMPDIR=/scratch
 ```
 
@@ -670,25 +708,25 @@ You can also arrange for the SLURM setup to automatically clean up such folders 
 
 Do you have a problem when your team trains models and you constantly have to buy more storage because huge model checkpoints aren't being offloaded to bucket storage fast enough?
 
-Here is a one-liner that will recursively analyze a path of your choice, find all the checkpoints, sum up their sizes and print the totals sorted by the biggest user, so that you could tell them to clean up their act :) Just edit `/mypath` to the actual path
+Here is a one-liner that will recursively analyze a path of your choice, find all the checkpoints, sum up their sizes and print the totals sorted by the biggest user, so that you could tell them to clean up their act :) Just edit `/mypath` to the actual path:
 
-```
+```bash
 find /mypath/ -type f -regextype posix-egrep -regex ".*\.(pt|pth|ckpt|safetensors)$" | \
 perl -nle 'chomp; ($uid,$size)=(stat($_))[4,7]; $x{$uid}+=$size;
 END { map { printf qq[%-10s: %7.1fTB\n], (getpwuid($_))[0], $x{$_}/2**40 }
 sort { $x{$b} <=> $x{$a} } keys %x }'
 ```
 
-gives:
+This produces an output like:
 ```
-user_a    :     2.5TB
-user_c    :     1.6TB
-user_b   :      1.2TB
+user_a   :     2.5TB
+user_c   :     1.6TB
+user_b   :     1.2TB
 ```
 
 Of course, you can change the regex to match other patterns or you can remove it altogether to measure all files:
 
-```
+```bash
 find /mypath/ -type f | \
 perl -nle 'chomp; ($uid,$size)=(stat($_))[4,7]; $x{$uid}+=$size;
 END { map { printf qq[%-10s: %7.1fTB\n], (getpwuid($_))[0], $x{$_}/2**40 }
@@ -697,7 +735,7 @@ sort { $x{$b} <=> $x{$a} } keys %x }'
 
 If you want to exclude some sub-dirs efficiently:
 
-```
+```bash
 find /mypath/ -regextype posix-egrep \
 -type d -regex "/mypath/(exlude_a|exclude_b|exclude_c)/.*" -prune -o \
 -type f -regex ".*\.(pt|pth|ckpt|safetensors)$" | \
@@ -706,7 +744,7 @@ END { map { printf qq[%-10s: %7.1fTB\n], (getpwuid($_))[0], $x{$_}/2**40 }
 sort { $x{$b} <=> $x{$a} } keys %x }'
 ```
 
-hint: the second line tells find to skip folders matching the `/mypath/(exlude_a|exclude_b|exclude_c)/.*` regex. Adapt to your use case as needed.
+hint: the second line tells `find` to skip folders matching the `/mypath/(exlude_a|exclude_b|exclude_c)/.*` regex. Adapt to your use case as needed.
 
 
 ### How to automatically delete old checkpoints
@@ -715,7 +753,7 @@ Continuing the item from above, if you want to automatically delete old checkpoi
 
 First try to ensure the candidates are indeed good to delete:
 
-```
+```bash
 find /mypath/ -regextype posix-egrep -regex ".*\.(pt|pth|ckpt|safetensors)$" -mtime +30
 ```
 
@@ -724,6 +762,11 @@ and when you feel it's safe to delete, only then add `rm`
 find /mypath/ -regextype posix-egrep -regex ".*\.(pt|pth|ckpt|safetensors)$" -mtime +30 -exec rm {} +
 ```
 
-## Contributors
+## Resources
 
-Ross Wightman
+### du alternatives
+
+`du` is a powerful Unix tool, but it can be slow and usually requires additional postprocessing to sort the outcome to make the latter useful, for example I often use this formula `du -ahd1 | sort -rh` for getting disk usage of a single level sorted by size.
+
+- [dust](https://github.com/bootandy/dust) - written in Rust, it runs faster than `du` and has a built in sorting. I find the no flags output to be confusing to read as it mixes many levels together and sub-sorts them, but it might be OK to others. `dust -F` and `dust -D` appear to be very useful and formatted well.
+- [baobab](https://github.com/GNOME/baobab) - analizes partitions quite quickly and provides a UI to navigate the results based on sub-folder size with easy copying of the paths useful when needing to delete a lot of old large dataset and checkpoint folders. I think this tool is only useful on a desktop since it requires GNOME env.

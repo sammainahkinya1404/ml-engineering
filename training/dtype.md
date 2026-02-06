@@ -8,6 +8,8 @@ Floating point formats:
 - fp16 - 16 bits
 - bf16 - 16 bits
 - fp8 - 8 bits (E4M3 and E5M2 formats)
+- fp6 - 6 bits
+- fp4 - 4 bits
 
 For visual comparison refer to this representations:
 
@@ -18,6 +20,28 @@ For visual comparison refer to this representations:
 ![fp16-bf16-fp8](images/fp16-bf16-fp8.png)
 
 ([source](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html))
+
+
+The new formats that are being adopted by new hardware are:
+- fp4: `float4_e2m1fn`
+- fp6:`float6_e2m3fn` and `float6_e3m2fn`
+- fp8: `float8_e3m4`, `float8_e4m3`, `float8_e4m3b11fnuz`, `float8_e4m3fn`, `float8_e4m3fnuz`, `float8_e5m2`, `float8_e5m2fnuz`, `float8_e8m0fnu`
+
+There is an excellent explanation of each of these variations [here](https://github.com/jax-ml/ml_dtypes?tab=readme-ov-file#specifications-of-implemented-floating-point-formats).
+
+To decipher the letters followed by the numbers:
+- The `e` indicates the length of exponent
+- The `m` indicates the length of mantissa
+- The `b` indicates the bias
+
+To decipher the letters appearing after the numbers:
+- The `f` indicates it is finite values only (no infinities).
+- The `n` indicates it includes NaNs, but only at the outer range.
+- The `u` stands for unsigned format.
+- The `uz` stands for unsigned zero.
+
+So for example: `float8_e4m3b11fnuz` stands for fp8 + 4-bit exponent + 3-bit mantissa + bias 11 + finite values only +  includes NaNs, but only at the outer range + unsigned zero.
+
 
 Integer formats used in quantization:
 
@@ -113,6 +137,6 @@ For an example of the latter see: [AnyPrecision optimizer](https://github.com/py
 
 Sometimes it's OK to change precision after the model was trained.
 
-- Using fp16-pretrained model in bf16 regime usually fails - due to overflows (the biggest number that can be represented in fp16 is 64k) for an indepth discussion and possible workaround see this [PR](https://github.com/huggingface/transformers/pull/10956).
+- Using bf16-pretrained model in fp16 regime usually fails - due to overflows (the biggest number that can be represented in fp16 is 64k) for an indepth discussion and possible workaround see this [PR](https://github.com/huggingface/transformers/pull/10956).
 
-- Using bf16-pretrained model in fp16 regime usually works - it will lose some performance on conversion, but should work - best to finetune a bit before using it.
+- Using fp16-pretrained model in bf16 regime usually works - it will lose some performance on conversion, but should work - best to finetune a bit before using it.

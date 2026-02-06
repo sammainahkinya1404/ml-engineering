@@ -237,17 +237,26 @@ def get_gpu_count():
 
 def torch_assert_equal(actual, expected, **kwargs):
     """
-    compare two tensors or non-tensor numbers for their equality
+    Compare two tensors or non-tensor numbers for their equality.
+    
+    Add msg=blah to add an additional comment to when assert fails.
     """
-    # assert_close was added around pt-1.9, it does better checks - e.g will check dimensions match
+    # assert_close was added around pt-1.9, it does better checks - e.g. will check that dimensions dtype, device and layout match
     return torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0, **kwargs)
 
 
 def torch_assert_close(actual, expected, **kwargs):
     """
-    compare two tensors or non-tensor numbers for their closeness.
+    Compare two tensors or non-tensor numbers for their closeness.
+
+    Add msg=blah to add an additional comment to when assert fails.
+
+    For default values of `rtol` and `atol` which are dtype dependent, see the table at https://docs.pytorch.org/docs/stable/testing.html#torch.testing.assert_close
+    For example for bf16 it is `rtol=1.6e-2` and `atol=1e-5`.
+    
+    The check doesn't assert when `|a - b| <= (atol + rtol * |b|)`
     """
-    # assert_close was added around pt-1.9, it does better checks - e.g will check dimensions match
+    # assert_close was added around pt-1.9, it does better checks - e.g. will check that dimensions dtype, device and layout match
     return torch.testing.assert_close(actual, expected, **kwargs)
 
 
@@ -323,7 +332,17 @@ def parameterized_custom_name_func_join_params(func, param_num, param):
     param_based_name = parameterized.to_safe_name("_".join(str(x) for x in param.args))
     return f"{func.__name__}_{param_based_name}"
 
-
+# When any function contains print() calls that get overwritten, like progress bars,
+# a special care needs to be applied, since under pytest -s captured output (capsys
+# or contextlib.redirect_stdout) contains any temporary printed strings, followed by
+# \r's. This helper function ensures that the buffer will contain the same output
+# with and without -s in pytest, by turning:
+# foo bar\r tar mar\r final message
+# into:
+# final message
+# it can handle a single string or a multiline buffer
+def apply_print_resets(buf):
+    return re.sub(r"^.*\r", "", buf, 0, re.M)
 
 class CaptureStd:
     """

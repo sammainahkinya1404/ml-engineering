@@ -204,26 +204,24 @@ a crazy idea: the older GPUs might do fine if you can actually feed them as fast
 
 - All that is missing is comparing different compute providers to how many floating point operations their hardware can computes per secs (TFLOPS) and their cost per unit and now you can tell the total approximate cost of the training.
 
-1. Calculate the time needed to train given the TFLOPS of the considered solution:
+  1. Calculate the time needed to train given the TFLOPS of the considered solution:
+     `total_tflops_required / tflops_of_this_compute_unit = time_in_seconds`
+     Let's say it came to be 604800 secs or 7 days.
 
-   `total_tflops_required / tflops_of_this_compute_unit = time_in_seconds`
+  2. Look at the cost of using this compute solution for 7 days and now you know the total $$ to train this model.
 
-   Let's say it came to be 604800 secs or 7 days.
-
-2. Look at the cost of using this compute solution for 7 days and now you know the total $$ to train this model.
-
-3. Look at other proposals and calculate the same - chose the best option.
+  3. Look at other proposals and calculate the same - chose the best option.
 
 - As mentioned earlier, time is of a huge importance, so you might still choose a more expensive solution if finishing the training sooner is important because you want to be first to market.
 
 Unfortunately, this math is only partially correct because the advertised peak TFLOPS are typically unachievable. The MFU section delves into it.
 
 
-### Model Flops Utilization (MFU)
+### Model FLOPS Utilization (MFU)
 
 As mentioned in the previous section, some (most?) vendors publish unrealistic peak performance TFLOPS - they aren't possible to achieve.
 
-Model Flops Utilization (MFU) is the metric that tells us how well the accelerator is utilized. Here is how it is calculated:
+Model FLOPS Utilization (MFU) is the metric that tells us how well the accelerator is utilized. Here is how it is calculated:
 
 1. Measure the actual TFLOPS by calculating how many floating point operations a single training iteration takes and dividing that number by the number of seconds this iteration took.
 2. Divide the actual TFLOPS by advertised TFLOPS to get the MFU
@@ -263,31 +261,30 @@ Why can't the advertised TFLOPS achieved? It's because it takes time to move dat
 
 ### Accelerators
 
-As of this writing here are the most common accelerators that can be used for training, finetuning and inference ML models:
+As of this writing here are the most common accelerators that can be used for training, finetuning and inferencing ML models:
 
 Widely available:
 
-  * NVIDIA A100 - huge availability across all clouds, but is already gradually being replaced by H100
+  * NVIDIA H200
+  * AMD MI325 on neoclouds primarily, MI355 is starting to appear
 
 Available, but locks you in:
 
-  * Google TPUs - fast! but the cost is a lock-in into a single vendor and cloud
+  * Google TPUs - fast! but the cost is a lock-in into a single vendor and cloud. It appears Google started to sell TPUs to some companies (outside of their cloud).
 
 Emerging to general availability:
 
-  * NVIDIA H100 - 2-3x faster than A100 (half precision), 6x faster for fp8
-
-  * AMD MI250 ~= A100 - very few clouds have them and most likely MI300X will be the first mainstream AMD GPU
-
-  * AMD MI300X ~= H100 - a few clouds will have those in March, 2024
-
-  * Intel Gaudi2 ~= H100 - starting to slowly emerge on Intel's cloud
-
-  * GraphCore IPU - very difficult to find, paperspace has them
-
+  * NVIDIA B200s/B300s/GB200/GB300s are starting to emerge.
+  * AMD MI355X are starting to emerge on Neo clouds and also large CSPs started to offer AMD GPUs
+  * Intel Gaudi3 > H200 - is available on Intel's cloud
+  * Amazon's Trainium2 < H100 is available on AWS, Trainium3 has been just announced
   * Cerebras WaferScale Engine - available on Cerebras' cloud
 
-For the full list see [Accelerators](../compute/accelerator).
+No longer available:
+
+* GraphCore IPU - very difficult to find if at all, was shortly available on paperspace but no more.
+
+For the full list and more recently announced accelerators see [Accelerators](../compute/accelerator).
 
 
 #### Accelerator Interoperability
@@ -298,9 +295,9 @@ For example, if your PyTorch application calls `torch.mm` - it should work every
 
 - NVIDIA GPUs: all based on [CUDA](https://developer.nvidia.com/cuda-toolkit), which most training frameworks support. You can easily moved between different NVIDIA GPUs and most things would work the same.
 
-- AMD MI250/MI300X: with PyTorch using [ROCm](https://pytorch.org/blog/pytorch-for-amd-rocm-platform-now-available-as-python-package/) you can run most CUDA-based software as is. This is really the only inter-operable accelerator with the NVIDIA stack.
+- AMD MI250/MI3**X: with PyTorch using [ROCm](https://pytorch.org/blog/pytorch-for-amd-rocm-platform-now-available-as-python-package/) you can run most CUDA-based software as is. This is really the only inter-operable accelerator with the NVIDIA stack.
 
-- Gaudi2: if you use HF Transformers/Diffusers you can use [optimum-habana](https://github.com/huggingface/optimum-habana). If you use HF Trainer with NVIDIA GPUs it should be relatively easy to switch to train/infer on Gaudi2.
+- Intel Gaudi2/Gaudi3: if you use HF Transformers/Diffusers you can use [optimum-habana](https://github.com/huggingface/optimum-habana). If you use HF Trainer with NVIDIA GPUs it should be relatively easy to switch to train/infer on Gaudi2.
 
 - GraphCore IPU: can also be run via PyTorch via [poptorch](https://github.com/graphcore/poptorch)
 
@@ -313,18 +310,18 @@ Also in general most ML code could be compiled into cross-platform formats like 
 
 - If you want to train a large model that doesn't fit onto a single accelerator's memory you have to rely on the intra- and inter-node networks to synchronize multiple accelerators.
 
-- The biggest issue right now is that compute hardware advancements move faster than networking hardware, e.g. for NVIDIA NVLink intra-node:
+- The biggest issue right now is that compute hardware advancements move faster than networking hardware, e.g. for NVIDIA NVLink intra-node (unidirectional bandwidth):
 
-| GPU  | Compute<b>fp16<br>TFLOPS | Compute<br>speedup | Intra-node<br>GBps | Intra-node<br>speedup |
+| GPU  | Compute<br>fp16<br>TFLOPS | Compute<br>speedup | Intra-node<br>GBps | Intra-node<br>speedup |
 | :--- |                      --: |                --: |                --: |                   --: |
-| V100 |                      125 |                  1 |                300 |                     1 |
-| A100 |                      312 |                2.5 |                600 |                     2 |
-| H100 |                      989 |                  8 |                900 |                     3 |
+| V100 |                      125 |                  1 |                150 |                     1 |
+| A100 |                      312 |                2.5 |                300 |                     2 |
+| H100 |                      989 |                  8 |                450 |                     3 |
+| B200 |                     2250 |                 18 |                900 |                     6 |
 
+- You can see that A100 was 2.5 faster than V100, and H100 is ~3x faster than A100. But the intra-node speed of NVLink has only increased by 150GBps each generation. NVLink 5.0 doubled the speed over NVLink 4.0 so it catches up a little bit with the compute speed ups. But the speed up is still insufficient.
 
-- You can see that A100 was 2.5 faster than V100, and H100 is ~3x faster than A100. But the intra-node speed of NVLink has only increased by 300GBps each generation.
-
-- Moreover, all 3 generations of NVLink use identical NICs of the same 50GBps duplex throughput. They have just doubled and tripled the number of links to speed things up. So there was 0 progress in that technology.
+- Moreover, the first 4 generations of NVLink use identical NICs of the same 25GBps unidirectional bandwidth. They have just doubled and tripled the number of links to speed things up. So there was 0 progress in that technology.
 
 - The inter-node situation isn't any better with most NICs there doing 100 or 200Gbps, and some 400Gbps are starting to emerge. (correspondingly in GBps: 12.5, 25 and 50). It's the same story here, some solutions provide dozens of NICs to get to higher speeds.
 
@@ -341,33 +338,27 @@ Also in general most ML code could be compiled into cross-platform formats like 
 
 NVIDIA:
 
-- NVIDIA-based compute nodes come with 50GBps duplex NVLInk
+- NVIDIA-based compute nodes come with 50GBps duplex NVLink
 
-- Some have a lot of NVLinks, others less but typically plenty w/ at least 900GBps (5.6Tbps) duplex for H100, 600GBps for A100 nodes
+- Some have a lot of NVLinks, others less, but typically plenty with 900GBps (7.2Tbps) unidirectional bandwidth for B200/B300,
+450GBps (3.6Tbps) for H100/H200, 300GBps for A100 nodes.
 
 Intel Gaudi2:
 
-- 8x 21 NICs of 100GbE RoCE v2 ROMA for a total of 2.1TBps
+- 8 x 21 NICs of 100GbE RoCE v2 ROMA for a total of 2.1TBps
 
 [More details](../network/README.md#intra-node-networking)
 
 
 #### Inter-node Network
 
-- An order of magnitude slower than Intra-node
+- You will see a wide range of speeds from 200Gbps to 6400Gbps
 
-- You will see a wide range of speeds from 50Gbps to 3200 Gbps
+- Originally an order of magnitude slower than Intra-node, now inter-node speed is starting to approach inter-node (e.g. 800GBps EFA vs 900GBps NVLink-5 on B300 instances)
 
-- You need to reduce gradients and other bits faster than compute to avoid idling accelerators
+- You need to reduce gradients and other tensors (e.g. MoE) faster than compute to avoid idling accelerators
 
-- You typically get at most 80% of advertised speed. e.g., if you are told you get 800Gbps, expect ~640Gbps.
-
-- If moving to fp8 H100 is 18x faster than V100
-
-- We are yet to see if 3200Gbps for H100s will be enough to keep high MFU.
-
-
-* Practically less than 3x but it's a good estimate
+- You typically get at most 80% of advertised speed. e.g., if you are told you get 800Gbps, expect ~640Gbps
 
 [More details](../network/README.md#inter-node-networking).
 
@@ -469,18 +460,18 @@ As you navigate this very complex AI industry here are some thing to be aware of
 
 - Obviously if you choose compute that requires custom software that works for that hardware only and you can't rent this hardware anywhere else you're setting yourself up for a lock-in
 
-
 ### Don't buy what you don't really need
 
 - The cloud providers have mostly the same generic hardware, which leads to a very slim $$ margin and so in order to make big $$ they invent products and then try to convince you that you need to buy them. Sometimes you actually need those products, but very often not. See also the previous section on lock-in, since proprietary products usually mean a partial lock-in.
 
 - Often it's easy to observe the 3 step marketing technique for solutions that seek a problem to solve:
 
-1. Convince a couple of well respected customers to use the provider's proprietary products by giving them huge discounts or even pay them to use them
-2. Use those in step 1 as the social approval lever to reel in more converts
-3. Then scoop the rest of the strugglers by telling them that 80% of your customers (1+2) use these amazing products
+  1. Convince a couple of well respected customers to use the provider's proprietary products by giving them huge discounts or even pay them to use them
+  2. Use those in step 1 as the social approval lever to reel in more converts
+  3. Then scoop the rest of the strugglers by telling them that 80% of your customers (1+2) use these amazing products
 
 When marketing these products it's important:
+
 - to mention how well they work with a dozen of other products, since now you're not buying into a single product but into a whole proprietary product-sphere.
 - to use really nice looking complicated diagrams of how things plug into each other, and move really fast to the next slide before someone asks a difficult question.
 
@@ -493,9 +484,9 @@ To conclude I thought I'd share some insights to how one could slightly improve 
 
 ### FOMO and avoiding depression
 
-If you read Twitter and other similar ML-related feeds you're guaranteed to feel the fear of missing out, since there is probably at least one new great model getting released weekly and multiple papers are getting published daily and your peers will publish their cool achievements hours.
+If you read Twitter and other similar ML-related feeds you're guaranteed to feel the fear of missing out, since there is probably at least one new great model getting released weekly and multiple papers are getting published daily and your peers will publish their cool achievements every few minutes.
 
-We are dealing with **very** complicated technology and there is a small handful of people who can absorb that much new material and understand / integrate it.
+We are dealing with **very complex** technology and there is a small handful of people who can absorb that much new material and understand / integrate it.
 
 This can be extremely depressing and discouraging.
 
@@ -519,15 +510,10 @@ So if you ask me something, chances are that I don't know it, but the saving gra
 
 Because the ML field is in a huge race, a lot of the open source software is half-baked, badly documented, badly tested, at times poorly supported. So if you think you can save time by re-using software written by others expect spending hours to weeks trying to figure out how to make it work. And then keeping it working when the updates break it.
 
-The next problem is that most of this software depends on other software which often can be just as bad. It's not uncommon where I start fixing some integration problem, just to discover a problem in a dependent package, which in its turn has another problem from another package. This can be extremely frustrating and discouraging. Once excepts to save time by reuse, but ends up spending a long time figuring out how to make it work. At least if I write my own software I have fun and it's a creative process, trying to make other people's software work is not.
+The next problem is that most of this software depends on other software which often can be just as bad. It's not uncommon where I start fixing some integration problem, just to discover a problem in a dependent package, which in its turn has another problem from another package. This can be extremely frustrating and discouraging. One tries to save time by code reuse, but ends up spending a long time figuring out how to make it work. At least if I write my own software I have fun and it's a creative process, trying to make other people's software work is not.
 
 So at the end of the day we are still better off re-using other people's software, except it comes at an emotional price and exhaustion.
 
 So first of all, try to find a way not to beat yourself up if the software you didn't write doesn't work. If you think about it, those problems aren't of your creation.
 
 Learning how to [debug efficiently](https://github.com/stas00/the-art-of-debugging/tree/master/methodology) should also make this process much less painful.
-
-
-## Contributors
-
-[Mark Saroufim](https://github.com/msaroufim),

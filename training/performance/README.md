@@ -100,14 +100,52 @@ The exact formula is in Equation 3 of Section 5.1 of the [Efficient Large-Scale 
 footnote: For Inference only it'd be: `24Bsh^2 + 4Bs^2h` floating point operations per layer.
 
 
+#### Automating FLOP calculation
+
+Until recently we had to rely on manual FLOP calculations as explained in the previous section - many of those formulas have mistakes in them, and many models behave differently depending on various configuration settings. So it can be tricky to get the FLOP count correctly (and across many different model architectures). But fear not, the awesome PyTorch team developed an automatic way of measuring FLOPs.
+
+```
+from torch.utils.flop_counter import FlopCounterMode
+
+flop_counter = FlopCounterMode(mods=model, display=False, depth=None)
+with flop_counter:
+    model(**input).sum().backward()
+total_flops =  flop_counter.get_total_flops()
+```
+Voila, you have the FLOPs counted for you!
+
+In my code I run it only on a 2nd iteration (as the first iteration is likely to have some additional compute that is run once). You don't need to repeat it again, you can just cache its value (well, unless you have a situation where iterations aren't the same for some reason).
+
+So all that remains is measuring the time it took each specific iteration to run and dividing FLOPs by time in seconds and `1e12` to get the performance TFLOPS.
+
+```
+tflops = total_flops / time / 1e12
+```
+
+This will give you a slightly different value on each iteration.
+
+
 ### MFU vs HFU
 
 Model FLOPS Utilization (MFU) and Hardware FLOPS Utilization (HFU) estimate how well the hardware is being utilized during `forward` and `backward` passes of the model (including any syncing networking overhead and possibly DataLoader IO).
 
-HFU measures the actual FLOPS. For example, the concept [Gradient checkpointing/Activation Recompution](#gradient-checkpointing) repeats all of parts of the `forward` pass a second time, so factually more FLOPS are used. Whereas MFU ignores implementation details and accounts only for the theoretical needs of the computation and thus less accurate.
+```
+MFU = Estimated_Achieved_FLOPS / Theoretical_FLOPS
+HFU = Actual_Achieved_FLOPS / Theoretical_FLOPS
+```
+
+HFU measures the actual FLOPS. For example, the technique of [Gradient checkpointing/Activation Recompution](#gradient-checkpointing) repeats all or some parts of the `forward` pass a second time, so factually more FLOS (FLoating point OperationS) are used. Whereas MFU ignores implementation details and accounts only for the theoretical needs of the computation and thus less accurate.
 
 [Reducing Activation Recomputation in Large Transformer Models](https://arxiv.org/abs/2205.05198) is a good paper to read about these concepts.
 
+`Theoretical_FLOPS` is what you see on the official accelerator specs. You can find the table of these values for high end accelerators [here](../../compute/accelerator#tflops-comparison-table). So let's use H100 as an example. Its BF16 theoretical TFLOPS is 989 TFLOPS.
+
+Now, say, you measured your actual training loop's performance and it was 400 TFLOPS as actual achieved FLOPS. Then your MFU is:
+```
+HFU = 400/989 = 0.40%
+```
+
+If you didn't use activation recomputation feature (not repeating `forward`) your HFU and MFU would be the same. If you did use it, your calculation will lead to less FLOS and thus lower FLOPS and thus MFU will be lower than HFU.
 
 For example [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) published the following stats for A100-80GB:
 
@@ -118,7 +156,28 @@ For example [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) published the f
 | 530B  | 56.0% | 57.0% |
 | 1T    | 56.3% | 57.0% |
 
+As you can see, since Megatron-LM was using activation recomputation for these trainings, MFU < HFU.
+
 More recent H100+A100 MFU/HFU numbers have been published [here](https://github.com/mosaicml/llm-foundry/tree/main/scripts/train/benchmarking#mfu-and-hfu).
+
+Now, whenever you see MFU or HFU numbers published you have to be careful comparing those numbers to any other similar numbers, until you know that the same way was used to calculate FLOPS. Since `HFU=Actual_Achieved_FLOPS/Theoretical_FLOPS` and `Theoretical_FLOPS` are fixed, the only variable here is the `Actual_Achieved_FLOPS` and since most of the time an estimated value is calculated based on parameter shapes, there are many versions of calculations out there, some of which are slightly imprecise whereas others are very imprecise. Compilers may also impact the effective FLOPs, by optimizing some operations away. Moreover you don't know how iteration time was measured.
+
+To recall `TFLOPS = FLOS / iteration_duration`. So, in order to do a fair comparison the 2 main questions to ask are:
+1. Was the total used floating point operations calculated in the same way?
+2. Was the time component calculated back-to-back of each iteration, including the `DataLoader` and logging, vs only `fwd`+`bwd` parts.
+
+If either one or both of these mismatch then you can't make a fair comparison.
+
+Unfortunately, most of the time papers and blog posts just report the MFU number w/o a link to how it was calculated.
+
+But, do not fear, if you have trouble comparing your results with competing results, remember the measurement artifacts described above.
+These artifacts do not improve the bottom-line throughput, thus, as long as you consistently use whatever way you choose to calculate TFLOPS, you will immediately see when your application's performance has improved or degraded, as relative numbers are most important for you.
+
+#### MFU is a very rough approximation
+
+Most of the training/finetuning regimes use a mixed precision, yet when MFU/HFU are calculated the fastest format's compute is used. For example, for a BF16-mixed precision training some parts of the compute are done in BF16, yet others in FP32! but we measure the FLOPS as if everything was done in BF16, which, of course, leads to a very imprecise measurement. Ideally, each segment of the compute will be measured separately to account to when which format was used. The reason it sort of works is because the smaller format compute usually dominates those mixed precision training regimes.
+
+Moreover, depending on the cluster setup - in particular storage IO and network IO are heavily involved, the same software may deliver different MFUs, because not all clusters are created equal. Therefore it's OK to compare your particular setup's MFU before and after the optimization, but it's very difficult to compare your setup's MFU to another team's cluster's MFU.
 
 
 ## How To Improve Speed and Save Memory
@@ -133,7 +192,7 @@ Here is an overview of what features can help to either improve speed or save me
 | Method                   | Speed  | Memory |
 | :----------------------  | :----  | :----- |
 | Gradient accumulation    | Yes    | Yes    |
-| Gradient checkpointing   | Yes    | Yes    |
+| Gradient checkpointing   | No*    | Yes    |
 | Mixed precision training | Yes    | No     |
 | Batch size               | Yes    | Yes    |
 | Optimizer choice         | Yes    | Yes    |
@@ -141,7 +200,7 @@ Here is an overview of what features can help to either improve speed or save me
 | DeepSpeed Zero           | No     | Yes    |
 | Flash Attention          | Yes    | Yes    |
 
-
+\* Gradient checkpointing slows things down for the given batch size, but since it frees up a lot of memory, enabling a much larger BS, it actually improves the overall speed.
 
 
 ### Anatomy of Model's Operations
@@ -203,6 +262,90 @@ Let's look at the details.
 
 There are the input and output that are being passed and returned by the forward and the backward functions and the forward activations saved for gradient computation.
 
+Here is a rough breakdown of activation memory per GPU:
+
+1. Activation working memory: `dtype_size * num_of_hidden_states_copies * bs * seqlen * hidden_size`
+2. Activation checkpoints memory: `dtype_size * num_layers * bs * seqlen * hidden_size`
+3. Logits working memory: `fp32_size * bs * seqlen * vocab_size`
+
+In all the following calculations:
+- `dtype_size`: size of the one element of `dtype` being used, e.g. `1` byte for fp8, `2` for bf16, `4` for fp32, etc.
+- `fp32_size`: `4` bytes
+- `bs`: batch size
+- `hidden_size`: hidden size of the model
+- `seqlen`: the sequence length
+- `num_layers`: the number of layers the model has
+- `vocab_size`: vocabulary size
+
+And `dtype_size * bs * seqlen * hidden_size` is the size of the `hidden_states` tensor, because that's its shape `[bs, seqlen, hidden_size]` multiplied by the size in bytes of a single element.
+
+In the following explanation let's use the Llama-3 architecture and its [8B configuration](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct/blob/main/config.json):
+```
+hidden_size=4096
+num_layer=32
+vocab_size=128256
+```
+
+and let's use
+```
+dtype=bf16 (2 bytes)
+bs=1
+seqlen=32768
+```
+
+We can immediately calculate the size of `hidden_states` tensor in bf16 to be: `2 * 1 * 32768 * 4096 / 2**30 = 0.25GiB`
+
+Part 1. So first let's calculate how much working memory is needed to process a single layer forward:
+
+`activation_memory_per_layer = num_of_hidden_states_copies * dtype_size * bs * seqlen * hidden_size`
+
+The `num_of_hidden_states_copies` is typically between 20 and 50 and will vary between different model architectures. To get a good feeling for the variations - let's measure a handful of models using [activation-memory-per-layer.py](benchmarks/activation-memory-per-layer.py). What we get is:
+```
+24.0 "HuggingFaceTB/SmolLM2-360M"
+28.0 "meta-llama/Llama-3.1-8B-Instruct"
+28.0 "mistralai/Mistral-7B-Instruct-v0.3"
+29.8 "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
+38.0 "Qwen/Qwen3-4B"
+48.0 "google/gemma-1.1-2b-it"
+```
+
+So it's easy to see that Gemma makes two times more copies of `hidden_states` than SmolLM2 to compute a single layer forward.
+
+It'd be difficult to compare the models exactly if their `hidden_size` isn't the same, but comparing the `num_of_hidden_states_copies` co-efficient is easy.
+
+Clearly some architectures allocate additional memory besides copies of `hidden_states` as can be seen with `deepseek-ai/DeepSeek-R1-0528-Qwen3-8B` whose co-efficient isn't an integer.
+
+Now to our example model:
+
+`activation_memory_per_layer = 2 * 28 * 1 * 32768 * 4096 / 2**30 = 7GiB` (`28` came from the measurements output a few paragraphs earlier for `meta-llama/Llama-3.1-8B-Instruct`).
+
+Part 2. Now that we know the memory allocated by each layer, 2 possible things will happen next depending on whether [gradient checkpointing](#gradient-checkpointing) is enabled or not:
+
+- If it's enabled, then we need to store `num_layers * hidden_states`.
+
+In our example that would be: `32 * 0.25 = 8GiB` (we calculated `hidden_states = 0.25GiB` earlier).
+
+- If it's not enabled, then activation memory will grow to `num_layers * activation_memory_per_layer`.
+
+In our example that would be: `32 * 7 = 224GiB`
+
+Notice 8GiB vs 224GiB - that's a huge difference - therefore, clearly everybody activates the [gradient checkpointing](#gradient-checkpointing) feature despite the cost of recalculating the forward pass a second time.
+
+Part 3. Finally we have the loss calculation which typically requires manifesting the logits in fp32 and here the `vocab_size` dimension is typically the biggest dimension, hence: `fp32_size * bs * seqlen * vocab_size`
+
+In our example that would be: `4 * 1 * 32768 * 128256 /  2**30 = 15.7GiB` (~16GB)
+
+As you can see logits will use more memory than all the checkpointing activations for this model.
+
+Moreover, practically you typically end up with a factor of 6 instead of 4 for `dtype_size`, since usually `logits` is first created in the lower precision and then upcast to fp32 so you have 2 copies of it, thus `2+4=6`.
+
+Part 4. Total required activation memory is the sum of memory needed to compute one layer forward + activation checkpoints + logits activation memory when using gradient checkpointing. When not using gradient checkpointing it's the sum of 2 and 3, i.e. all the forwards activations and the logits memory.
+
+In our example:
+
+- w/ gradient checkpointing: `7 + 8 + 16 = 31GB`
+- w/o gradient checkpointing: `224 + 16 = 240GiB`
+
 **Temporary Memory**
 
 Additionally there are all kinds of temporary variables which get released once the calculation is done, but in the moment these could require additional memory and could push to OOM. Therefore when coding it's crucial to think strategically about such temporary variables and sometimes to explicitly free those as soon as they are no longer needed.
@@ -234,7 +377,7 @@ In addition to the memory usage described in the previous section, there are oth
 
 #### Preloaded CUDA kernels memory usage
 
-When PyTorch uses CUDA for the first time, it may use up 0.5-2GB of GPU memory, reducing the GPU's total available memory.
+When PyTorch uses CUDA for the first time, it may use up 0.5-2GB of GPU memory, reducing the GPU's total available memory. This memory won't be accounted for by torch memory profiler.
 
 The size of allocated memory for cuda kernels varies between different GPUs, and also it can be different between pytorch versions. Let's allocate a 4-byte tensor on cuda and check how much GPU memory is used up upfront.
 
@@ -271,12 +414,37 @@ pt=2.1.1+cu121: used=0.47GB, free=78.68GB, total=79.15GB
 There is a 450MB difference, but here we only loaded kernels to do `torch.ones` - the actual memory allocated at run time with other code using torch API will be somewhere between 0.47 and 0.92GB.
 
 
+#### `torch.distributed` memory usage
+
+When using `torch.distributed` expect ~1-2GB of GPU memory taken away just to initialize things - the more GPUs the higher the memory used. Different backends are likely to use a different amount of memory. And this memory won't be accounted for by torch memory profiler.
+
+Here is [torch-dist-mem-usage.py](distributed/torch-dist-mem-usage.py) that demonstrates the actual memory usage:
+
+```
+$ python -u -m torch.distributed.run --nproc_per_node=2 --rdzv_endpoint localhost:6000  --rdzv_backend c10d \
+torch-dist-mem-usage.py
+[...]
+[0] mp: before barrier
+[0] mp: MA 0.00 GB | Max_MA 0.00 GB | CA 0.00 GB | Max_CA 0.00 GB | NV 0.55 GB | CPU Virtual Memory:  used = 68.79 GB, percent = 3.4%
+[0] mp: after barrier
+[0] mp: MA 0.00 GB | Max_MA 0.00 GB | CA 0.00 GB | Max_CA 0.00 GB | NV 2.00 GB | CPU Virtual Memory:  used = 69.33 GB, percent = 3.5%
+[0] mp: after 2nd barrier
+[0] mp: MA 0.00 GB | Max_MA 0.00 GB | CA 0.00 GB | Max_CA 0.00 GB | NV 2.00 GB | CPU Virtual Memory:  used = 69.33 GB, percent = 3.5%
+[0] mp: after dist destroy
+[0] mp: MA 0.00 GB | Max_MA 0.00 GB | CA 0.00 GB | Max_CA 0.00 GB | NV 1.28 GB | CPU Virtual Memory:  used = 69.25 GB, percent = 3.5%
+[0] mp: after dist destroy
+[0] mp: MA 0.00 GB | Max_MA 0.00 GB | CA 0.00 GB | Max_CA 0.00 GB | NV 1.28 GB | CPU Virtual Memory:  used = 69.25 GB, percent = 3.5%
+```
+
+So you can see that the [CUDA kernels](#preloaded-cuda-kernels-memory-usage) took 0.55GB (first line `NV 0.55 GB`), but when `dist.barrier` was run an additional 1.5GB were consumed. If you run `init_process_group` with `device_id` arg then the additional memory allocation will move to that call instead and less will be used by `dist.barrier`.
+
+
 #### Memory fragmentation
 
-As the model allocates and frees tensors, the memory could fragment. That is there could be enough free memory to allocate, say, 1GB of contiguous memory, but it could be available in 100s of small segments spread out through the memory and thus even though the memory is available it can't be used unless very small allocations are made.
+As the model allocates and frees tensors, the GPU memory could fragment. That is there could be enough free memory to allocate, say, 1GB of contiguous memory, but it could be available in 100s of small segments spread out through the memory and thus even though the memory is available it can't be used unless very small allocations are made.
 
-Environment variable `PYTORCH_CUDA_ALLOC_CONF` comes to help and allows you to replace the default memory allocation mechanisms with more efficient ones. For more information see [Memory management](https://pytorch.org/docs/stable/notes/cuda.html#memory-management).
-
+Environment variable `PYTORCH_ALLOC_CONF` comes to help and allows you to replace the default memory allocation mechanisms with more efficient ones. For more information see [Memory management](https://pytorch.org/docs/stable/notes/cuda.html#memory-management).
+I found `PYTORCH_ALLOC_CONF=expandable_segments` to be extremely helpful when the code performs a lot of tensor reshaping, which would normally massively fragment the GPU memory.
 
 
 
@@ -471,7 +639,42 @@ If you're using [Flash Attention](https://github.com/Dao-AILab/flash-attention),
 ![flash attention](images/flash-attention.png)
 
 
-### Final recommendations for sizing
+### SwiGLU-based MLP
+
+Models such as PaLM, LLaMA, Mistral and others use the SwiGLU activation function in place of the more common GLU activation function.
+
+The SwiGLU-based MLP contains an additional learned matrix in its activation function. There the MLP block contains 3 matrices instead of the original 2. To preserve the total number of parameters in the MLP block the paper that introduces [SwiGLU](https://arxiv.org/abs/2002.05202) proposes to use `dim_mlp = 8/3*dim_attn` instead of the typical `dim_mlp = 4*dim_attn`. The [The Case for Co-Designing Model Architectures with Hardware](https://arxiv.org/abs/2401.14489) paper provides recommendations for finding the value of hidden dimension (`h`) that would lead to the best `matmul` performance, and if you used `8/3*h` is likely to result in a much slower MLP block, because `8/3` will break all the alignments.
+
+In order to overcome this problem one only needs to realize that the `8/3` coefficient is only a suggestion and thus it’s possible to find other near by coefficients that would lead to better-shaped MLP matrices. In fact if you look at the publicly available LLama-2 models, its 7B variant uses `11008/4096 = 2.6875` as a coefficient, which is quite close to `8/3 = 2.667`, and its 70B variant uses a much larger `28672/8192 = 3.5` coefficient. Here the 70B variant ended up with an MLP block that contains significantly more parameters than a typical transformer block that doesn’t use SwiGLU.
+
+Now that we know the recommended coefficient isn’t exact and since a good `h` has already been chosen, one can now search for a good nearby coefficient that still leads to high-performance GEMMs in the MLP. Running a brute-force search reveals that Llama-2-7B’s intermediate size is indeed one of the best performing sizes in its range.
+
+Here is [swiglu-maf-bench.py](benchmarks/matrix-shape/swiglu-maf-bench.py) that can be easily adapted to your use-case and once run on the target hardware the training will happen on, you will be able to find the best hidden size of the MLP.
+
+Let's run it on H100 with `h = 4096`:
+
+```
+./swiglu-maf-bench.py
+Wanted the closest to 10922 d_ff value that leads to the highest TFLOPS (d_hidden=4096)
+
+Searching 50 steps in the range of 10822 .. 11022
+Results: baseline, followed by near-by best performing d_ff results:
+
+ d_ff  tflops mlp_params
+-------------------------
+10922  272.73 134209536
+-------------------------
+10944  398.38 134479872
+10848  395.62 133300224
+10880  395.52 133693440
+10912  395.16 134086656
+11008  395.01 135266304
+```
+
+As it can be easily seen the `8/3*4096=10922` leads to a rather slow performance. But `10944`, which is just `22` bigger than `10922`, gives a whooping 46% speedup for the `matmul`. The total corresponding MLP parameters is printed as well, should you want to choose slightly slower choices but with a different number of parameters.
+
+
+### Final recommendations for model sizing
 
 The full recommendations are:
 1. Vocab size divisible by 64
@@ -479,8 +682,263 @@ The full recommendations are:
 3. `b*s`, `h/a`, and `h/t` should be divisible by a power of 2
 4. `(b*a)/t` should be an integer
 5. `t` should be small as possible
+6. For SwiGLU search for the best performing hidden size close to `8/3*h`
+
+### Additional reading
+
+- [What Shapes Do Matrix Multiplications Like?](https://www.thonking.ai/p/what-shapes-do-matrix-multiplications)
 
 
-## Contributors
 
-[Quentin Anthony](https://github.com/Quentin-Anthony)
+
+## NUMA affinity
+
+[Non-uniform memory access (NUMA)](https://en.wikipedia.org/wiki/Non-uniform_memory_access) is a computer memory design used in multiprocessing, where the memory access time depends on the memory location relative to the processor.
+As modern servers have more than one CPU to get the best performance accelerators residing in the same NUMA node as the corresponding CPU should have the processes bound to that same NUMA node.
+
+First, let's understand what do NUMA nodes signify.
+
+Here is a typical A100 8x GPUs server NUMA nodes diagram:
+
+![a100 server numa nodes](images/a100-server-hwloc.png)
+
+As you can see it has 2 CPUs, each defining a NUMA block, and each such block contains a group of 4 GPUs. The GPUs are the grey blocks that say `CoProc` with 108 compute units (SMs) and 79GB of memory.
+
+footnote: the diagram was generated by `lstopo a100.png` from [hwloc](https://github.com/open-mpi/hwloc).
+
+If you're using Hyper-Threads then you want to use `lstopo -l` to see the HT core count presented correctly. For example if you have 2 NUMA nodes with 8 accelerators and 104 physical cpu-cores and 208 logical cores - thus (`208/8=26` HT-cores per GPU), then the HT cores will be for:
+
+- gpu0..3 `[0, 1,  2, 3, ...,  51, 104, 105, 106, ..., 129]`
+- gpu4..7 `[52, 53, 54, ..., 103, 156, 157, 158, ..., 207]`
+
+You first get the physical cpu-core counts and then the remaining HT cores, hence the strange gap.
+
+If this is an NVIDIA node, the other way to easily see the CPU affinity is to run:
+
+```
+$ nvidia-smi topo -m
+        GPU0    GPU1    GPU2    GPU3    GPU4    GPU5    GPU6    GPU7    CPU Affinity    NUMA Affinity
+GPU0     X      NV18    NV18    NV18    NV18    NV18    NV18    NV18    0-51,104-155    0
+GPU1    NV18     X      NV18    NV18    NV18    NV18    NV18    NV18    0-51,104-155    0
+GPU2    NV18    NV18     X      NV18    NV18    NV18    NV18    NV18    0-51,104-155    0
+GPU3    NV18    NV18    NV18     X      NV18    NV18    NV18    NV18    0-51,104-155    0
+GPU4    NV18    NV18    NV18    NV18     X      NV18    NV18    NV18    52-103,156-207  1
+GPU5    NV18    NV18    NV18    NV18    NV18     X      NV18    NV18    52-103,156-207  1
+GPU6    NV18    NV18    NV18    NV18    NV18    NV18     X      NV18    52-103,156-207  1
+GPU7    NV18    NV18    NV18    NV18    NV18    NV18    NV18     X      52-103,156-207  1
+```
+On this H100 cluster you can see the `CPU Affinity` column which tells you which cores reside together with the first and the second group of GPUs, and the `NUMA Affinity` column.
+
+Now that it's clear that the various compute components are placed in 2 or more groups, to achieve the best performance we need to ensure that the components communicate within the group they belong to, and avoid any cross-talk. For example, if gpu0 belong to NUMA node 0, then the process that drives this GPU should only use cpu-cores from NUMA node 0.
+
+The same should apply to networking or any other components that you may have control over.
+
+Practically though in my experience so far if your workload is very light on CPU work this change will make very little difference to the overall performance, but can be quite impactful if a lot of CPU use is done. On the other hand if doing the most efficient thing is easy, even the tiniest improvement is likely to accumulate over long training jobs, so it's worth to implement, IMHO.
+
+### NUMA process binding
+
+There are multiple ways to accomplish the binding of processes to the cpu-cores of the right NUMA node.
+
+#### numactl
+
+One of the most common tools to do that is using `numactl`, which sets the NUMA affinity as it launches a new process.
+
+For example, let's see how it can be integrated with the `torchrun` launcher.
+
+This launcher currently needs a helper util [numa-set.sh](benchmarks/numa/numa-set.sh) to perform NUMA affinity settings, once you downloaded it and made it executable, you can now get the right NUMA affinity using:
+
+```
+torchrun --nproc_per_node=8 --role : --tee 3 --no-python ./numa-set.sh your-program.py
+```
+
+Note: you'd need `numactl` installed on your system for this util to work.
+
+For example, here is how you can validate that the assignments are correct:
+```
+torchrun --nproc_per_node=8 --role : --tee 3 --no-python ./numa-set.sh python -c \
+'import os; cores=os.sched_getaffinity(0); print(f"{len(cores)} visible cpu cores: {cores}")'
+```
+
+On a system with 208 HT cpu-cores, you will most likely see:
+
+```
+[:0]:104 visible cpu cores: {0, 1, 2, 3, 4, 5...
+[:1]:104 visible cpu cores: {0, 1, 2, 3, 4, 5...
+[:2]:104 visible cpu cores: {0, 1, 2, 3, 4, 5...
+[:3]:104 visible cpu cores: {0, 1, 2, 3, 4, 5...
+[:4]:104 visible cpu cores: {52, 53, 54, 55, ...
+[:5]:104 visible cpu cores: {52, 53, 54, 55, ...
+[:6]:104 visible cpu cores: {52, 53, 54, 55, ...
+[:7]:104 visible cpu cores: {52, 53, 54, 55, ...
+```
+
+The first 4 accelerators use the first half of the cpu-cores and the other 4 the second half, which matches the earlier explanations of the right setting.
+
+If you remove `./numa-set.sh`, you'd get:
+
+```
+torchrun --nproc_per_node=8 --role : --tee 3 --no-python python -c \
+'import os; cores=os.sched_getaffinity(0); print(f"{len(cores)} visible cpu cores: {cores}")'
+```
+You will see that all 8 processes see all 208 cpu-cores:
+```
+[:0]:208 visible cpu cores: {0, 1, 2, 3, ...
+```
+
+so as each process has access to any cpu-core - a cross talk may occur, which may introduce a small performance overhead.
+
+
+#### os.sched_setaffinity
+
+You can, of course, change the NUMA affinity after the program was launched. You saw the use of `os.sched_getaffinity` to get the current settings, and the corresponding `os.sched_setaffinity` is used to change it.
+
+```
+import os
+os.sched_setaffinity(0, [0, 1])
+```
+Here we told the system that the process running this script (`0`) can only use cpu-cores `0` and `1`.
+
+So now we just need to figure out how to programmatically get the right cpu sets for each accelerator's process. Here is how to do it with [pynvml](#pynvml).
+
+#### pynvml
+
+If you're using NVIDIA GPUs, `pynvml` (`pip install pynvml`) can be very helpful to get all sorts of information about the gpu and not needing to call `nvidia-smi` - in this situation we are going to use for it to tell us the correct affinity given a GPU index.
+
+In [numa-set-pynvml.py](benchmarks/numa/numa-set-pynvml.py) you will find a working helper function that you could call at the very top of your training loop like so:
+```
+local_rank = torh.distributed.get_rank()
+set_numa_affinity(0, verbose=True)
+```
+call it before `DataLoader` is initialized to get the workers use the right cpu-cores!
+
+Normally, the local process rank equals the gpu index, but if one uses `CUDA_VISIBLE_DEVICES` - this might not be true any longer - if you use it, you will need to remap the process rank to the actual index:
+
+```
+gpu_index = int(os.environ.get("LOCAL_RANK", 0))
+if "CUDA_VISIBLE_DEVICES" in os.environ:
+    ids = list(map(int, os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")))
+    gpu_index = ids[gpu_index] # remap
+```
+
+The other gotcha can be `CUDA_DEVICE_ORDER` which typically defaults to `PCI_BUS_ID`, but one could also set it to
+`CUDA_DEVICE_ORDER=FASTEST_FIRST` if you have mixed GPUs, but it's very very unlikely that you will run into this in a high end server setup, so you can safely ignore this.
+
+
+#### srun
+
+If using SLURM and you're OK with using `srun` as the launcher, rather than `torchrun`, `accelerate`, etc., it'll do all the binding work for you automatically. See the full launcher [here](../../orchestration/slurm/launchers/srun-launcher.slurm).
+
+To make it NUMA affinity-ready all you need to add is these 2 headers:
+```
+#SBATCH --gres-flags=enforce-binding
+#SBATCH --ntasks-per-socket=4
+```
+
+`--ntasks-per-socket=4` assumes you have 2 cpu sockets with 8 accelerators - so `8/2=4` accelerators per socket.
+
+This is an even more precise solution, since it'd assign each process its own group of cpu-cores, rather than just give all the NUMA node 0 cpu-cores to the processes driving accelerators 0-3, and NUMA node 1 cpu-cores to the processes driving accelerators 4-7.
+
+#### Specific launchers
+
+Various launchers have support for NUMA affinity settings:
+
+- [HF Accelerate](https://github.com/huggingface/accelerate) has a flag `--enable_cpu_affinity` that you add to the `accelerate` launch command and it'll do this for you. Available since `accelerate>0.28.0`.
+- [torchrun](https://github.com/pytorch/pytorch) doesn't have it, but I showed how to do it in this [section](#numactl).
+- srun was covered [here](#srun).
+
+
+## DataLoader
+
+### Asynchronous DataLoader
+
+The default setting is `num_workers=0`, which means whenever you call `next(iter(dataloader))` the data is actively fetched in real time - which means there will be an IO overhead and if there are any transforms those would be applied in real time as well - all blocking the accelerator's compute.
+
+The solution is to use the asynchronous `DataLoader` by setting `num_workers > 0`. Typically, unless your `DataLoader` is extremely slow 2 workers is enough:
+
+```
+DataLoader(..., num_workers=2, ...
+```
+
+Now when `next(iter(dataloader))` is called the data should be already in the CPU memory with all the transforms done. It still needs to be copied to the accelerator memory - to speed that up see [Pinned memory and non blocking device copy](#pinned-memory-and-non-blocking-device-copy).
+
+Here is a benchmark which emulates a slow data transform: [num-workers-bench.py](benchmarks/dataloader/num-workers-bench.py)
+
+```
+num_workers=0: average time: 5.388
+num_workers=1: average time: 3.900
+num_workers=2: average time: 1.333
+num_workers=3: average time: 0.839
+num_workers=4: average time: 0.875
+```
+
+So you can see that in this particular case the speed was dramatically improving up to 3 workers. If the `DataLoader` is very light and does very little the difference will be much smaller, but 0 workers will always lead to the biggest overhead.
+
+By measuring the performance of your workload you can finetune this number by trying lower and higher values. But remember that each one of the workers may consume a lot of CPU memory. So on a node of 8 accelerators with 2 workers, that would be 16 additional processes. Nowadays, the compute nodes have often hundreds of cpu cores and a TBs of CPU memory so there should be plenty of resources for many workers to be supported. In the past it was a different story.
+
+Also note that because any data transforms are applied asynchronously and ahead of time, the CPU and memory speed don't matter much in this case. e.g. with 2 workers as long as the next iteration data preparation takes less than 2 compute iterations the `DataLoader` shouldn't be a bottleneck.
+
+Beware that sometimes you may encounter problems using `num_workers > 0` - the pytorch Issues has a few related Issues that haven't been resolved in several years, where a worker would hang. In particular when having 2 `Dataloader`s. In fact we had this problem during BLOOM-176B training, where the training `Dataloader` worked fine with 2 workers, but once eval `Dataloader` was added it'd randomly hang - so we after failing to figure it out we resorted to a workaround of `num_workers=0` just for the eval and switch to doing it very rarely. Eventually, we stopped doing eval altogether and started doing lm-harness style async eval done to the saved intermediary checkpoints instead, which also sped up the training process.
+
+case study: during IDEFICS-80B training we were using a streaming `Dataloader` which worked really bad and it was consuming huge amounts of memory per worker, and it'd spike often, and we had about 1TB of CPU memory and we couldn't spawn enough workers - so the `Dataloader` was a bottleneck. We didn't have time to find a better solution at that time so we finished training with it.
+
+
+
+### Pinned memory and non-blocking device copy
+
+A combination of:
+
+1. `DataLoader(pin_memory=True, ...)`
+2. `batch.to(device="cuda", non_blocking=True)`
+
+is likely to make the `DataLoader` less of a bottleneck.
+
+1. Enabling pinned memory allows for a more efficient data transfer from CPU to accelerator memory.
+2. non-blocking will further speed things up by allowing some overlap between compute and data movements
+
+Here is a small benchmark demonstrating the difference: [pin-memory-non-block-bench.py](benchmarks/dataloader/pin-memory-non-block-bench.py). When I run it on an A100 80GB-PCIe, the output was:
+```
+pin_memory= True, non_blocking= True: average time: 0.459
+pin_memory= True, non_blocking=False: average time: 0.522
+pin_memory=False, non_blocking= True: average time: 0.658
+pin_memory=False, non_blocking=False: average time: 0.646
+```
+so you can see that `pin_memory=True`+`non_blocking=True` is a worthy change.
+
+For more background you can read [1](https://pytorch.org/docs/stable/notes/cuda.html#use-pinned-memory-buffers) and [2](https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/).
+
+Notes:
+- Pinned memory is treated specially by the OS, by preventing the paging out when the total available memory is low, so it reduces the total amount of available memory to other programs. Thus use with care.
+- I recall that a few times people reported problems when using pinned memory - I think it's mostly when the system doesn't have much CPU memory to start with or they used too much of pinned memory, so the OS can start swapping heavily.
+- If you measure your [per iteration TFLOPS](#tflops-as-a-performance-metric) you can compare the throughput with and w/o these changes and choose the one that works the best. It'd be even easier to see the impact if you measure the `DataLoader` overhead separately from the the `forward/backwards` and post-compute (usually logging, which can be surprisingly slow at times).
+
+
+## torch.compile
+
+`torch.compile` will eventually speed things up amazingly for both training and inference. It's very difficult to make it work well on a random model, because the level of complexities to overcome is huge. There are some models that already work well with it, but many are still a long term work in progress.
+
+If you tried it and thing don't work you:
+1. may report it to the PyTorch team, ideally with a small reproducible example
+2. can try to read this extensive [torch.compile, the missing manual](https://docs.google.com/document/d/1y5CRfMLdwEoF1nTk9q8qEu1mgMUuUtvhklPKJ2emLU8/edit#heading=h.ivdr7fmrbeab) and you might be able to make some things work, and may still need to report some issues to PyTorch
+
+One thing is certain is that you want to use the latest pytorch version, which most likely would be some recent nightly build, rather than the last released version (though you might start with the latter).
+
+
+
+## Automatic garbage collection
+
+Python periodically performs an automatic garbage collection based on internal heuristics. In an LLM-training scenario with hundreds to thousands of accelerators used in synchronization - if different ranks follow even slightly different code paths the automatic garbage collection process could be triggered at different times for different ranks. Which means that one or more ranks could be slower than other ranks while performing this operation, and thus becoming stragglers, slowing down the whole ensemble.
+
+Usually one can see this by studying [the MFU plot](#mfu-vs-hfu) where downward spikes can be observed.
+
+If this happens to your training you can disable the automatic garbage collection with:
+```
+import gc
+gc.disable()
+```
+at the beginning of your trainer and then manually perform garbage collection at the desired intervals. For example, calling this once in a training iteration:
+```
+import gc
+gc.collect()
+```
+
+Refer to [`gc`'s manpage](https://docs.python.org/3/library/gc.html) for more nuances.

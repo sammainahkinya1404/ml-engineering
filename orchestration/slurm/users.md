@@ -106,7 +106,7 @@ srun --pty --partition=dev --nodes=1 --ntasks=1 --cpus-per-task=96 --gres=gpu:8 
 
 ## Hyper-Threads
 
-By default, if the cpu has hyper-threads (HT), SLURM will use it. If you don't want to use HT you have to specify `--hint=nomultithread`.
+By default, if the cpu has [Hyper-Threads](https://en.wikipedia.org/wiki/Hyper-threading) (HT) enabled, SLURM will use it. If you don't want to use HT you have to specify `--hint=nomultithread`.
 
 footnote: HT is Intel-specific naming, the general concept is simultaneous multithreading (SMT)
 
@@ -126,6 +126,15 @@ This last approach will allocate one thread per core and in this mode there are 
 Note that depending on your application there can be quite a performance difference between these 2 modes. Therefore try both and see which one gives you a better outcome.
 
 On some setups like AWS the all-reduce throughput degrades dramatically when `--hint=nomultithread` is used! Whereas on some other setups the opposite is true - the throughput is worse without HT!
+
+To check if your instances has HT enabled, run:
+
+```
+$ lscpu | grep Thread
+Thread(s) per core: 2
+```
+
+If it's `2` then it is HT-enabled, if it's `1` then it isn't.
 
 
 ## Reuse allocation
@@ -182,7 +191,7 @@ TODO: need to experiment with this to help training finish gracefully and not st
 
 ## Detailed job info
 
-While most useful information is preset in various `SLURM_*` env vars, sometimes the info is missing. In such cases use:
+While most useful information is preset in various `SLURM_*` env vars, sometimes some information is missing. In such cases use:
 ```
 scontrol show -d job $SLURM_JOB_ID
 ```
@@ -194,13 +203,25 @@ For a job that finished its run use:
 sacct -j JOBID
 ```
 
-e.g. with more details, depending on the partition:
+This command is also useful to discover if you have any `srun` jobs already running on that allocation (including those that were finished or cancelled). For example, you could kill some run-away `srun` step via `scancel <jobid>.<step-id>` and you'd find that `<step-id>` via the above command. The main job will continue running if it's an interactive job even if you cancelled all step jobs.
+
+To see more details:
 ```
-sacct -u `whoami` --partition=dev  -ojobid,start,end,state,exitcode --format nodelist%300  -j JOBID
-sacct -u `whoami` --partition=prod -ojobid,start,end,state,exitcode --format nodelist%300  -j JOBID
+sacct -ojobid,start,end,state,exitcode --format nodelist%300  -j JOBID
+sacct -j JOBID --long
 ```
 
+Or to see all jobs with their sub-steps while limiting the listing to a specific partition and only for your own user:
 
+```
+sacct -u `whoami` --partition=dev  -ojobid,start,end,state,exitcode --format nodelist%300
+sacct -u `whoami` --partition=prod -ojobid,start,end,state,exitcode --format nodelist%300
+```
+
+To see how a particular job was launched and all of its `srun` sub-step command lines:
+```
+sacct -j JOBID -o submitline -P
+```
 
 ## show jobs
 
@@ -348,6 +369,31 @@ See the table at the top of this document for which partition is which.
 - drng: the node is running a job, but will after completion not be available due to an administrative reason
 
 
+### Node state codes
+
+The node state could be followed by a single character which has a special meaning. It is one of:
+
+- `*`: The node is presently not responding and will not be allocated any new work. If the node remains non-responsive, it will be placed in the DOWN state (except in the case of COMPLETING, DRAINED, DRAINING, FAIL, FAILING nodes).
+- `~`: The node is presently in powered off.
+- `#`: The node is presently being powered up or configured.
+- `!`: The node is pending power down.
+- `%`: The node is presently being powered down.
+- `$`: The node is currently in a reservation with a flag value of "maintenance".
+- `@`: The node is pending reboot.
+- `^`: The node reboot was issued.
+- `-`: The node is planned by the backfill scheduler for a higher priority job.
+
+### Job state codes
+
+- `CD` | Completed: The job has completed successfully.
+- `CG` | Completing: The job is finishing but some processes are still active.
+- `F` | Failed: The job terminated with a non-zero exit code and failed to execute.
+- `PD` | Pending: The job is waiting for resource allocation. It will eventually run.
+- `PR` | Preempted: The job was terminated because of preemption by another job.
+- `R` | Running: The job currently is allocated to a node and is running.
+- `S` | Suspended: A running job has been stopped with its cores released to other jobs.
+- `ST` | Stopped: A running job has been stopped with its cores retained.
+
 
 ### drained nodes
 
@@ -451,7 +497,9 @@ The idea is this:
 3. if you need to stop the job array train - don't cancel it, but suspend it without losing your place in a queue
 4. when ready to continue - unsuspend the job array - only the time while it was suspended is not counted towards its age, but all the previous age is retained.
 
-The only limitation of this recipe is that you can't change the number of nodes, time and hardware and partition constraints once the job array was launched.
+The number of nodes, time and hardware and partition of a running job cannot be modified, but you can change pending jobs in the job array by `scontrol update jobid=<desired_job_id> numnodes=<new number> partition=<new partition>`.
+
+If you do have `sudo` access then you can change the job time of the current job as well.
 
 Here is an example:
 
@@ -495,14 +543,14 @@ scontrol release <jobid>
 ```
 
 
-## How to keep the scalloc allocation while exiting its shell
+## How to keep an salloc allocation alive while exiting its shell
 
 If you run allocated a node like so:
 
 ```
 salloc --partition=dev --nodes=1 --ntasks-per-node=1 --time=1:00:00 bash
 ```
-and you exited the shell, the allocation will be lost.
+and you exited the shell, or your ssh connection got dropped, the allocation will be lost.
 
 If you want to open an allocation that should survive exiting the shell, use `--no-shell` and no `bash` like so:
 
@@ -510,6 +558,25 @@ If you want to open an allocation that should survive exiting the shell, use `--
 salloc --no-shell --partition=dev --nodes=1 --ntasks-per-node=1 --time=1:00:00
 ```
 and now if you need to join the session see [How to rejoin the allocated node interactively](#how-to-rejoin-the-allocated-node-interactively).
+
+But beware, that if you `ssh` to the allocated node and launch something normally and then close the connection that job will be lost as the connecting shell will send `SIGHUP` to its child processes. To avoid that and to keep the job running use `nohup` while putting the program into a background process. Example:
+
+```
+nohup my-program &
+```
+
+`nohup` will ignore `SIGHUP` and will redirect stderr to stdout and append stdout to a special file `nohup.out`. If you want to control where the std streams should be written use normal stdout redirect `>` or `>>`, e.g.:
+```
+nohup my-program >> some-file.txt &
+```
+
+As mentioned earlier the program is also sent into the background with `&`.
+
+Now you can safely disconnect and the program will continue running when you come back.
+
+This solution will prevent the program from exiting, but you won't be able to interact with it normally when you connect again as the std streams will be redirected. You can of course still kill the program via its pid, chance its `nice` state, etc., like you'd do with any other process.
+
+But if you want to use something where you can disconnect and reconnect and continue using the program normally you'd have to use a [terminal multiplexer](https://en.wikipedia.org/wiki/Terminal_multiplexer) program like [`tmux`](https://github.com/tmux/tmux) or [GNU `screen`](https://www.gnu.org/software/screen/) which run a daemon on the node and allow you to regain the normal control over the program on reconnection. There are also [`mosh`](https://github.com/mobile-shell/mosh) and other similar tools which further aid this process.
 
 
 
@@ -1116,3 +1183,54 @@ $ echo $TOTAL_JOB_GPUS
 ```
 
 Replace `$SLURM_JOBID` with the SLURM job id if it's not already set in the shell you run the command from ([`squeue`](#show-jobs)).
+
+
+## How long did the job take to run
+
+While normally `squeue` will show you the duration of the currently running job, in order to see how long a job run for when it finished, you need to know the job id and then you can query it like so:
+
+```
+$ sacct -j 22171 --format=JobID,JobName,State,Elapsed
+JobID           JobName      State    Elapsed
+------------ ---------- ---------- ----------
+22171          example   COMPLETED   00:01:49
+```
+
+so we know the job finished running in under 2min.
+
+## FairShare
+
+Many SLURM clusters use the FairShare system where the more someone uses the cluster the less of the priority they get to run jobs or if there is a pre-emption in place they are more likely to get pre-empted
+
+To see your FairShare scores run:
+```
+sshare
+```
+
+Example:
+
+```
+Account                    User  RawShares  NormShares    RawUsage  EffectvUsage  FairShare
+-------------------- ---------- ---------- ----------- ----------- ------------- ----------
+root                                          0.000000   711506073      1.000000
+ all                                     1    0.500000   711506073      1.000000
+  all                      stas          1    0.022727    14106989      0.019827   0.288889
+```
+
+If your FairShare score is more than 0.5 that means you have been using the cluster less than what you  have been allocated, if it's less than 0.5 it means you have been using more than what was allocated.
+
+As the time passes this score gets decayed so if you were having a very low score and have you have been using the cluster much less then your score will raise over time.
+
+To see the score of a specific user:
+```
+sshare -u username
+```
+
+To see everybody's scores, sorted by FairShare:
+```
+sshare --all | sort -nk7 -r
+```
+
+This is the most important output, since it doesn't really matter what your score is alone. What matters is your score relative to all other users. Everybody who has a higher score than you will have a higher chance at getting they job yielded first and a lower chance of getting their job preempted.
+
+Besides FairShare the priorities are typically configured based on a combination of multiple metrics, usually including the length of time a job has been waiting in the queue, job size, Quality of Service (QOS) setting, partition specifics, etc. The specifics will depend on how the slurm has been configured by your sysadmin.

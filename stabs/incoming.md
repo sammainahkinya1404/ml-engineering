@@ -9,6 +9,39 @@ https://quarto.org/, https://quarto.org/docs/gallery/, https://kevinheavey.githu
 
 https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html
 
+Dirk Groeneveld's Script that checks node pairs for speed https://github.com/allenai/OLMo/commit/f91cebdfa299bf55e815d496c367de8b59881c2e
+```
+#!/bin/bash
+
+NCCL_LIB_DIR=/var/lib/tcpxo/lib64 source /var/lib/tcpxo/lib64/nccl-env-profile.sh
+
+set -euxo pipefail
+
+HOST_VARS=$(sed 's/ \{1,\}/ -x /g' <<<"${!NCCL*} LD_LIBRARY_PATH")
+FIRST_HOST=$(( echo "$1" && echo "$2" ) | sort | head -1)
+mpirun \
+  --mca btl self,tcp \
+  --mca btl_tcp_if_include enp0s12 \
+  --mca orte_base_help_aggregate 0 \
+  -H $1,$2 \
+  -np 2 \
+  --bind-to none \
+  -npernode 1 \
+  -tag-output \
+  -x ${HOST_VARS} \
+  -x NCCL_NET=FasTrak \
+  -x GLOO_SOCKET_IFNAME=enp0s12 \
+  -x CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  -x OMP_NUM_THREADS=16 \
+  bash -c "source ~/venv/OLMo/bin/activate && torchrun --nproc_per_node 8 --nnodes=2 --rdzv-backend=c10d --rdzv-endpoint=$FIRST_HOST ~/OLMo/scripts/augusta/all_reduce_bench.py"
+```
+and to run:
+```
+# checking all node pairs for reduce perf
+fgrep -hv \# ~/hostfiles/hosts | \
+parallel -N2 'echo {} $(./check_node_pair.sh {} 2>&1 | fgrep busbw)'
+```
+
 
 # Storage chapter
 
@@ -74,7 +107,7 @@ Make a new benchmark section:
 
 1. nccl-tests
 2. `all_reduce_bench.py`
-3. https://github.com/microsoft/DeepSpeedExamples/tree/master/benchmarks/communication
+3. https://github.com/deepspeedai/DeepSpeedExamples/tree/master/benchmarks/communication
 4. like nccl-tests, another common set of benchmarks used at HPC sites are the OSU microbenchmarks like osu_lat, osu_bw, and osu_bibw.
 
 https://mvapich.cse.ohio-state.edu/benchmarks/
@@ -150,7 +183,7 @@ Print driver configuration (interface name comes from `ifconfig`):
 - `ib_atomic_bw`
 - `ib_atomic_lat`
 
-example: `ib_send_bw -a address` - test bandwith
+example: `ib_send_bw -a address` - test bandwidth
 
 `qperf` measures bandwidth and latency between two nodes (TCP/IP and RDMA transports)
 
@@ -169,7 +202,13 @@ sudo apt-get install -y automake dh-make git libcap2 libnuma-dev libtool make pk
 sudo sed -i -e 's/# OS.EnableRDMA=y/OS.EnableRDMA=y/g' /etc/waagent.conf
 ```
 
-- Verbs: allow command to be executed on feature-rich IB swtich.
+- Verbs: allow command to be executed on feature-rich IB switch.
+
+
+# SLURM
+
+repos to explore:
+https://github.com/OleHolmNielsen/Slurm_tools
 
 
 # Testing
@@ -225,3 +264,62 @@ https://github.com/LLNL/scr/tree/develop/python#installing-the-scr-python-module
 
 Example checkpoint in python:
 https://github.com/LLNL/scr/blob/1878de8756c2b51882a7cda7b97b142eae4e3995/python/scr_example.py#L64-L105
+
+
+
+  396  dmesg | grep -i 'limited by'
+  397  sudo dmesg | grep -i 'limited by'
+  398  nvidia-smi nvlink -e
+
+
+GPU VBIOS version might be important when researching issues. Let's add the name and bus id to the query, we get:
+
+```
+$ nvidia-smi --query-gpu=gpu_name,gpu_bus_id,vbios_version --format=csv
+
+$ nvidia-smi -q | grep "VBIOS Version"
+    VBIOS Version                         : 96.00.89.00.01
+    [...]
+    VBIOS Version                         : 96.00.89.00.01
+```
+
+
+Check error counters of NVLink links
+
+```
+$ nvidia-smi nvlink -e
+GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-abcdefab-cdef-abdc-abcd-abababababab)
+         Link 0: Replay Errors: 0
+         Link 0: Recovery Errors: 0
+         Link 0: CRC Errors: 0
+
+         Link 1: Replay Errors: 0
+         Link 1: Recovery Errors: 0
+         Link 1: CRC Errors: 0
+
+         [...]
+
+         Link 17: Replay Errors: 0
+         Link 17: Recovery Errors: 0
+         Link 17: CRC Errors: 0
+```
+
+Another useful command is:
+```
+$ nvidia-smi nvlink --status
+GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-abcdefab-cdef-abdc-abcd-abababababab)
+         Link 0: 26.562 GB/s
+         [...]
+         Link 17: 26.562 GB/s
+```
+this one tells you the current speed of each link
+
+Run `nvidia-smi nvlink -h` to discover more features (reporting, resetting counters, etc.).
+
+nvidia-smi --query-remapped-rows=gpu_name,gpu_bus_id,remapped_rows.failure,remapped_rows.pending,\
+remapped_rows.correctable,remapped_rows.uncorrectable \
+--format=csv gpu_name, gpu_bus_id, remapped_rows.failure,remapped_rows.pending,\
+remapped_rows.correctable, remapped_rows.uncorrectable
+
+
+nvidia-smi --query-remapped-rows=gpu_name,gpu_bus_id,remapped_rows.failure,remapped_rows.pending,remapped_rows.correctable,remapped_rows.uncorrectable --format=csvgpu_name, gpu_bus_id, remapped_rows.failure, remapped_rows.pending, remapped_rows.correctable,remapped_rows.uncorrectable
